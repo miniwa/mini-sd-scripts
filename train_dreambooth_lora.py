@@ -186,4 +186,4 @@ def train_dreambooth_lora(
 
 
 if __name__ == "__main__":
-  fire.Fire(train)
+  fire.Fire(train_dreambooth_lora)
