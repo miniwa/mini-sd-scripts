@@ -1,11 +1,15 @@
 import torch
 from diffusers import UNet2DConditionModel, AutoencoderKL, DDPMScheduler
-from torch import Tensor
+from diffusers.models.vae import DiagonalGaussianDistribution
+from torch import Tensor, FloatTensor
 from torch.nn.functional import mse_loss
 from transformers import CLIPTextModel
 
 from mini.asserts import Asserts
 from mini.dataloader import DataLoaderBatch, DreamboothDataLoaderBatch
+
+# Fairly certain this could be found in one of the model configs somewhere.
+LATENT_SCALE_FACTOR = 0.18215
 
 
 def loss_step(
@@ -15,8 +19,6 @@ def loss_step(
   vae: AutoencoderKL,
   noise_scheduler: DDPMScheduler,
 ):
-  # Fairly certain this could be found in one of the model configs somewhere.
-  LATENT_SCALE_FACTOR = 0.18215
   Asserts.check(noise_scheduler.config["prediction_type"] == "epsilon")
   is_dreambooth = isinstance(batch, DreamboothDataLoaderBatch)
   if is_dreambooth:
@@ -31,8 +33,7 @@ def loss_step(
     image_caption_ids = normal_batch.batch_image_caption_ids
 
   with torch.no_grad():
-    latents = vae.encode(image_pixels).latent_dist.sample()
-    latents = latents * LATENT_SCALE_FACTOR
+    latents = encode_and_sample_latents(image_pixels, vae, LATENT_SCALE_FACTOR)
 
     # Latents with noise.
     noise = torch.randn_like(latents)
@@ -59,3 +60,9 @@ def loss_step(
   else:
     loss = mse_loss(pred, target, reduction="mean")
     return loss
+
+
+def encode_and_sample_latents(image_pixels: Tensor, vae: AutoencoderKL, latent_scale_factor: float) -> FloatTensor:
+  sampled_latents = vae.encode(image_pixels).latent_dist.sample()
+  sampled_latents = sampled_latents * latent_scale_factor
+  return sampled_latents

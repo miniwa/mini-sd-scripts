@@ -1,12 +1,10 @@
 from typing import List, NamedTuple
 
 import torch
-from diffusers import AutoencoderKL
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from transformers import CLIPTokenizer
 
-from mini.asserts import Asserts
 from mini.dataset import Example, LoraDataset, DreamboothExample, DreamboothDataset
 
 
@@ -59,32 +57,21 @@ class Collator:
 
 
 class DreamboothCollator:
-  def __init__(self, tokenizer: CLIPTokenizer, instance_caption: str, reg_caption: str, batch_size: int):
+  def __init__(self, tokenizer: CLIPTokenizer, instance_caption: str, reg_caption: str):
     self.tokenizer = tokenizer
-    self.batch_size = batch_size
-    instance_ids: List[int] = tokenizer(
+    self.instance_tokens = tokenizer(
       instance_caption,
       padding="do_not_pad",
       truncation=True,
       max_length=self.tokenizer.model_max_length
-    ).input_ids
-    instance_ids_batched = [instance_ids for _ in range(batch_size)]
-    reg_ids: List[int] = tokenizer(
+    )
+
+    self.reg_tokens = tokenizer(
       reg_caption,
       padding="do_not_pad",
       truncation=True,
       max_length=self.tokenizer.model_max_length
-    ).input_ids
-    reg_ids_batched = [reg_ids for _ in range(batch_size)]
-    combined_ids = instance_ids_batched + reg_ids_batched
-
-    # Will always be the same for any given instance and reg image.
-    self.cached_batch_caption_ids: Tensor = tokenizer.pad(
-      {"input_ids": combined_ids},
-      padding="max_length",
-      max_length=self.tokenizer.model_max_length,
-      return_tensors="pt"
-    ).input_ids
+    )
 
   def __call__(self, examples: List[DreamboothExample]) -> DreamboothDataLoaderBatch:
     instance_image_pixels = [example.instance_image_pixels for example in examples]
@@ -92,14 +79,26 @@ class DreamboothCollator:
     combined_image_pixels = instance_image_pixels + reg_image_pixels
 
     batch_stacked_image_pixels = torch.stack(combined_image_pixels).to(memory_format=torch.contiguous_format)
-    image_pixels_size = batch_stacked_image_pixels.shape[0]
-    caption_ids_size = self.cached_batch_caption_ids.shape[0]
-    Asserts.check(image_pixels_size == self.batch_size * 2, "Image pixels not aligned to batch size.")
-    Asserts.check(caption_ids_size == self.batch_size * 2, "Caption ids not aligned to batch size.")
+    nr_examples = len(examples)
+    batch_caption_ids = self.captions_for(nr_examples)
+
     return DreamboothDataLoaderBatch(
       batch_stacked_image_pixels=batch_stacked_image_pixels,
-      batch_stacked_captions_ids=self.cached_batch_caption_ids
+      batch_stacked_captions_ids=batch_caption_ids
     )
+
+  def captions_for(self, image_count: int) -> Tensor:
+    instance_tokens_batched = [self.instance_tokens for _ in range(image_count)]
+    reg_tokens_batched = [self.reg_tokens for _ in range(image_count)]
+    combined_ids = instance_tokens_batched + reg_tokens_batched
+
+    batch_tokens = self.tokenizer.pad(
+      combined_ids,
+      padding="max_length",
+      max_length=self.tokenizer.model_max_length,
+      return_tensors="pt"
+    )
+    return batch_tokens.input_ids
 
 
 def build_dataloader(
@@ -138,13 +137,23 @@ def build_dreambooth_dataloader(
   tokenizer: CLIPTokenizer,
   instance_caption: str,
   reg_caption: str,
-):
+  cache_dataset: bool
+) -> DataLoader[DreamboothDataLoaderBatch]:
+  if cache_dataset:
+    cached = []
+    for example in dataset:
+      cached.append(example)
+    _dataset = cached
+  else:
+    _dataset = dataset
+
   return DataLoader(
-    dataset,
+    _dataset,
     batch_size=batch_size,
     shuffle=True,
-    collate_fn=DreamboothCollator(tokenizer, instance_caption, reg_caption, batch_size),
+    collate_fn=DreamboothCollator(tokenizer, instance_caption, reg_caption),
     pin_memory=True,
-    #num_workers=4,
-    #persistent_workers=True
+    num_workers=1,
+    prefetch_factor=10,
+    persistent_workers=True
   )

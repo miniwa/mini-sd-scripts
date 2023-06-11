@@ -4,11 +4,9 @@ import fire
 import torch
 from accelerate import Accelerator
 from torch import optim
-from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
 from transformers import get_scheduler
 
-from mini.asserts import Asserts
 from mini.dataloader import build_dreambooth_dataloader, DreamboothDataLoaderBatch
 from mini.dataset import DreamboothDataset
 from mini.inject import KOHYA_UNET_INJECTION_TARGETS, \
@@ -23,6 +21,10 @@ def train_dreambooth_lora(
   pretrained_vae_name_or_path: str | None,
   dataset_instance_images_dir: str,
   dataset_reg_images_dir: str,
+  dataset_aug_color_jitter: bool,
+  dataset_aug_horizontal_flip: bool,
+  dataset_aug_random_crop: bool,
+  dataset_aug_random_crop_cover_percent: float,
   db_instance_caption: str,
   db_reg_caption: str,
   output_dir: str,
@@ -36,6 +38,7 @@ def train_dreambooth_lora(
   train_scale_lr_by_batch: bool,
   train_scheduler_name: str,
   train_scheduler_num_warmup_steps: int,
+  train_dropout_percent: float,
   optim_enable_gradient_checkpointing: bool,
   optim_train_fp16: bool,
   optim_gradient_accumulation_steps: int,
@@ -57,32 +60,40 @@ def train_dreambooth_lora(
   dataset = DreamboothDataset(
     size=(512, 512),
     instance_images_dir=dataset_instance_images_dir,
-    reg_images_dir=dataset_reg_images_dir
+    reg_images_dir=dataset_reg_images_dir,
+    aug_color_jitter=dataset_aug_color_jitter,
+    aug_horizontal_flip=dataset_aug_horizontal_flip,
+    aug_random_crop=dataset_aug_random_crop,
+    aug_random_crop_cover_percent=dataset_aug_random_crop_cover_percent,
   )
   dataloader = build_dreambooth_dataloader(
     dataset=dataset,
-    batch_size=train_batch_size,
     tokenizer=tokenizer,
     instance_caption=db_instance_caption,
     reg_caption=db_reg_caption,
+    batch_size=train_batch_size,
+    cache_dataset=True,
   )
 
   print("Injecting lora layers..")
   unet_params, unet_keys = inject_trainable_linear_lora(
     unet,
     KOHYA_UNET_INJECTION_TARGETS,
-    lora_rank=lora_rank
+    lora_rank=lora_rank,
+    dropout_percent=train_dropout_percent
   )
   te_params, te_keys = inject_trainable_linear_lora(
     text_encoder,
     KOHYA_TEXT_ENCODER_INJECTION_TARGETS,
-    lora_rank=lora_rank
+    lora_rank=lora_rank,
+    dropout_percent=train_dropout_percent
   )
   _all_trainable_params = chain(unet_params, te_params)
   print(f"Injected {len(unet_keys)} linear lora layers into UNet model.")
   print(f"Injected {len(te_keys)} linear lora layers into text encoder model.")
 
   # Put into train mode and freeze the weights that are not lora layers.
+  vae.eval()
   unet.train()
   text_encoder.train()
   unet.requires_grad_(False)
@@ -139,11 +150,10 @@ def train_dreambooth_lora(
   sum_loss.requires_grad_(False)
   acc_steps = optim_gradient_accumulation_steps
   while step_count < train_max_steps:
+    batch: DreamboothDataLoaderBatch
     for batch in dataloader:
-      _batch_typed = Asserts.cast_to(batch, DreamboothDataLoaderBatch)
-
       loss = loss_step(
-        batch=_batch_typed,
+        batch=batch,
         unet=unet,
         text_encoder=text_encoder,
         vae=vae,
@@ -155,7 +165,7 @@ def train_dreambooth_lora(
 
       loss = loss / acc_steps
       accelerator.backward(loss)
-      clip_grad_norm_(_all_trainable_params, 1.0)
+      accelerator.clip_grad_norm_(_all_trainable_params, 1.0)
       should_update_weights = step_count % acc_steps == 0
       if should_update_weights:
         optimizer.step()

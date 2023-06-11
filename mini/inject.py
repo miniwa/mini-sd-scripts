@@ -56,7 +56,12 @@ def search_module_for_class(_module: nn.Module, search_class: List[Type[nn.Modul
                                       module_name=child_name)
 
 
-def inject_trainable_linear_lora(_module: nn.Module, injection_targets: List[str] | None, lora_rank: int):
+def inject_trainable_linear_lora(
+  _module: nn.Module,
+  injection_targets: List[str] | None,
+  lora_rank: int,
+  dropout_percent: float
+):
   keys = []
   trainable_parameters = []
   # We search for all linear layers in the module, that is a child of any of the injection targets.
@@ -85,7 +90,9 @@ def inject_trainable_linear_lora(_module: nn.Module, injection_targets: List[str
     lora = InjectedLinearLora(
       module_to_replace.in_features,
       module_to_replace.out_features,
-      bias=old_bias is not None, rank=lora_rank
+      bias=old_bias is not None,
+      rank=lora_rank,
+      dropout_percent=dropout_percent
     )
     lora.linear.weight = old_weight
     if old_bias is not None:

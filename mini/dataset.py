@@ -1,9 +1,9 @@
 import logging
 from glob import glob
+from math import sqrt
 from pathlib import Path
 from typing import Tuple, NamedTuple, List
 
-import torch
 from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
@@ -29,7 +29,16 @@ class ImageNameWithCaption(NamedTuple):
 
 
 class LoraDataset(Dataset[Example]):
-  def __init__(self, size: Tuple[int, int], instance_images_dir: str, tokenizer: CLIPTokenizer):
+  def __init__(
+    self,
+    size: Tuple[int, int],
+    instance_images_dir: str,
+    tokenizer: CLIPTokenizer,
+    aug_color_jitter: bool,
+    aug_horizontal_flip: bool,
+    aug_random_crop: bool,
+    aug_random_crop_cover_percent: float
+  ):
     self.tokenizer = tokenizer
     self.size = size
 
@@ -50,8 +59,7 @@ class LoraDataset(Dataset[Example]):
       caption = Path(caption_name).read_text().strip()
       _parsed = ImageNameWithCaption(source_image_name, caption)
       self.image_names_with_captions.append(_parsed)
-
-    self.transform = build_image_transforms(size)
+    self.transform = build_image_transforms(size, aug_color_jitter, aug_horizontal_flip, aug_random_crop, aug_random_crop_cover_percent)
 
   def __len__(self) -> int:
     return len(self.image_names_with_captions)
@@ -69,11 +77,19 @@ class LoraDataset(Dataset[Example]):
 
 
 class DreamboothDataset(Dataset[DreamboothExample]):
+  """
+  Note: This dataset will not generate all possible pairs between instance and regularization images.
+  Instead, one image is chosen for each regularization image. This is to prevent duplicate regularization images.
+  """
   def __init__(
     self,
     instance_images_dir: str,
     reg_images_dir: str,
-    size: Tuple[int, int]
+    size: Tuple[int, int],
+    aug_color_jitter: bool,
+    aug_horizontal_flip: bool,
+    aug_random_crop: bool,
+    aug_random_crop_cover_percent: float
   ):
     self.size = size
     Asserts.check(size == (512, 512), f"Only size {(512, 512)} is supported.")
@@ -86,20 +102,25 @@ class DreamboothDataset(Dataset[DreamboothExample]):
     self.reg_image_names = find_image_names(_reg_image_path)
     Asserts.check(len(self.instance_image_names) > 0, f"No source images found in '{instance_images_dir}'.")
     Asserts.check(len(self.reg_image_names) > 0, f"No regularization images found in '{reg_images_dir}'.")
-
-    self._len = len(self.instance_image_names) * len(self.reg_image_names)
-    self.image_transforms = build_image_transforms(size)
+    self.instance_transform = build_image_transforms(
+      size,
+      aug_color_jitter,
+      aug_horizontal_flip,
+      aug_random_crop,
+      aug_random_crop_cover_percent
+    )
+    self.regularization_transform = build_image_transforms(size, False, False, False, 1.0)
 
   def __len__(self) -> int:
-    return self._len
+    return len(self.reg_image_names)
 
   def __getitem__(self, index: int) -> DreamboothExample:
     instance_idx = index % len(self.instance_image_names)
-    reg_idx = index // len(self.instance_image_names)
+    reg_idx = index
     instance_image_name = self.instance_image_names[instance_idx]
     reg_image_name = self.reg_image_names[reg_idx]
-    instance_image_pixels = open_and_transform(instance_image_name, self.image_transforms)
-    reg_image_pixels = open_and_transform(reg_image_name, self.image_transforms)
+    instance_image_pixels = open_and_transform(instance_image_name, self.instance_transform)
+    reg_image_pixels = open_and_transform(reg_image_name, self.regularization_transform)
     return DreamboothExample(instance_image_pixels, reg_image_pixels)
 
 
@@ -111,19 +132,43 @@ def open_and_transform(image_name: str, _transforms: transforms.Compose) -> Tens
 
 
 def find_image_names(image_dir: Path) -> List[str]:
-  image_names =  glob(f"{image_dir}/*.jpg") +\
-                 glob(f"{image_dir}/*.png")+\
-                 glob(f"{image_dir}/*.jpeg")
+  image_names = glob(f"{image_dir}/*.jpg") +\
+                glob(f"{image_dir}/*.png") +\
+                glob(f"{image_dir}/*.jpeg")
   return image_names
 
 
-def build_image_transforms(size: Tuple[int, int]) -> transforms.Compose:
-  def _resize_to_max_square(image: Image.Image) -> Image.Image:
+def build_image_transforms(
+  size: Tuple[int, int],
+  aug_color_jitter: bool,
+  aug_horizontal_flip: bool,
+  aug_random_crop: bool,
+  aug_random_crop_cover_percent: float
+) -> transforms.Compose:
+  def _resize_to_max_square_and_random_crop(image: Image.Image) -> Image.Image:
     min_size = min(image.size)
-    return transforms.CenterCrop(min_size)(image)
+    square = transforms.CenterCrop(min_size)(image)
+    if aug_random_crop:
+      scale = sqrt(aug_random_crop_cover_percent)
+      scaled_size = int(min_size * scale)
+      return transforms.RandomCrop(scaled_size)(square)
+    else:
+      return square
+
+  if aug_color_jitter:
+    color_jitter = transforms.ColorJitter(0.05, 0.05)
+  else:
+    color_jitter = transforms.Lambda(lambda x: x)
+
+  if aug_horizontal_flip:
+    horizontal_flip = transforms.RandomHorizontalFlip(p=0.5)
+  else:
+    horizontal_flip = transforms.Lambda(lambda x: x)
 
   return transforms.Compose([
-    transforms.Lambda(_resize_to_max_square),
+    horizontal_flip,
+    color_jitter,
+    transforms.Lambda(_resize_to_max_square_and_random_crop),
     transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.5], std=[0.5]),
